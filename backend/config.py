@@ -11,6 +11,24 @@ from register_auth import ScopedKey, parse_scoped_keys
 @dataclass(frozen=True)
 class AppConfig:
     app_env: str
+    def redacted_summary(self) -> dict[str, any]:
+        """Return a dict representation of the config where secret fields are redacted.
+        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
+        presence (True if set, False otherwise). Non‑secret fields retain their original
+        values.
+        """
+        from dataclasses import asdict
+        secret_fields = {
+            "metrics_token",
+            "tracing_endpoint",
+            "register_api_key",
+            "register_api_key_previous",
+        }
+        raw = asdict(self)
+        for field in secret_fields:
+            if field in raw:
+                raw[field] = raw[field] is not None
+        return raw
     cors_origins: list[str]
     max_content_length: int
     max_video_bytes: int

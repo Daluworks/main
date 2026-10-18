@@ -236,15 +236,22 @@ def create_app() -> Flask:
         service_version=config.release_id,
     )
     app = Flask(__name__)
+    # Initialize verifier cache using config
     app.extensions["verifier_cache"] = VerifierCache(
         max_size=config.verifier_cache_max_size,
         positive_ttl_seconds=config.verifier_cache_positive_ttl_seconds,
         negative_ttl_seconds=config.verifier_cache_negative_ttl_seconds,
     )
+    # Log config summary on startup
+    LOGGER.info("App started with config summary")
+    log_structured(LOGGER, logging.INFO, {"event": "app_start", "config": config.redacted_summary()})
+    # Continue setup
     CORS(app, **cors_kwargs(config.cors_origins))
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
     # Propagate the request id through every response (header + JSON body).
     register_request_id_propagation(app)
+    
+
 
     # ------------------------------------------------------------------ #
     # Rate limiting                                                        #

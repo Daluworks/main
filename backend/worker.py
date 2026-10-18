@@ -1,6 +1,6 @@
 import time
 import os
-import logging
+from logging_utils import log_structured
 import threading
 import traceback
 from pathlib import Path
@@ -203,6 +203,9 @@ def tx_verification_loop(stop_event: threading.Event):
 
 def run_worker():
     init_db()
+    config = load_config()
+    LOGGER.info("Worker started with config summary")
+    log_structured(LOGGER, logging.INFO, {"event": "worker_start", "config": config.redacted_summary()})
     LOGGER.info(f"Starting worker {WORKER_ID}")
     
     stop_verification_event = threading.Event()
