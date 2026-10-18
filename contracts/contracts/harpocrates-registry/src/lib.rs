@@ -393,6 +393,17 @@ pub struct TimelockProposal {
 pub const DEFAULT_TIMELOCK_MIN_DELAY_SECS: u64 = 86_400;
 pub const MAX_TIMELOCK_MIN_DELAY_SECS: u64 = 604_800;
 pub const MAX_PENDING_TIMELOCK_PROPOSALS: u32 = 16;
+/// Maximum number of proposals a single `list_timelock_proposals` page may return.
+pub const MAX_TIMELOCK_PROPOSALS_PAGE: u32 = 25;
+
+/// Paginated result from `list_timelock_proposals`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposalPage {
+    pub proposals: SorobanVec<TimelockProposal>,
+    /// Cursor for the next page (`Some(next_cursor)`), or `None` if end reached.
+    pub next_cursor: Option<u32>,
+}
 
 /// A narrowly scoped, expiring authority to act for `grantor`.
 #[contracttype]
@@ -2405,6 +2416,59 @@ impl HarpocratesRegistry {
             .persistent()
             .get(&DataKey::ProposalSeq)
             .unwrap_or(0u32)
+    }
+
+    /// Enumerate timelocked proposals across sequential IDs.
+    ///
+    /// - `cursor`: ID offset to start scanning from (e.g. 0 or 1 starts at first proposal).
+    ///   Proposals use 1-based sequential IDs. If `cursor == 0`, scanning begins at ID 1.
+    /// - `limit`: maximum number of proposals to return; capped at `MAX_TIMELOCK_PROPOSALS_PAGE`.
+    ///   If 0 or exceeding the cap, `limit` is clamped to `MAX_TIMELOCK_PROPOSALS_PAGE`.
+    /// - Non-existent/deleted proposals are skipped.
+    /// - Read-only query; no auth required.
+    pub fn list_timelock_proposals(
+        env: Env,
+        cursor: u32,
+        limit: u32,
+    ) -> TimelockProposalPage {
+        let effective_limit = if limit == 0 || limit > MAX_TIMELOCK_PROPOSALS_PAGE {
+            MAX_TIMELOCK_PROPOSALS_PAGE
+        } else {
+            limit
+        };
+
+        let total_seq: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalSeq)
+            .unwrap_or(0u32);
+
+        let mut proposals = SorobanVec::new(&env);
+        let mut next_cursor: Option<u32> = None;
+
+        let mut id = if cursor == 0 { 1u32 } else { cursor };
+
+        while id <= total_seq {
+            if let Some(proposal) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimelockProposal>(&DataKey::Proposal(id))
+            {
+                proposals.push_back(proposal);
+                if proposals.len() == effective_limit {
+                    if id < total_seq {
+                        next_cursor = Some(id + 1);
+                    }
+                    break;
+                }
+            }
+            id = id.saturating_add(1);
+        }
+
+        TimelockProposalPage {
+            proposals,
+            next_cursor,
+        }
     }
 
     pub fn get_timelock_min_delay_secs(env: Env) -> u64 {
