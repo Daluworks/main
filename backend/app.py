@@ -1685,7 +1685,18 @@ def create_app() -> Flask:
             return jsonify({"error": "Output file missing"}), 404
             
         result = job.get("result", {})
-        response = send_file(output_path, mimetype="video/mp4", as_attachment=True, download_name="harpocrates-evidence.mp4")
+        etag = result.get("embedded_hash")
+        if not etag:
+            etag = sha256_file(output_path)
+            
+        response = send_file(
+            output_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="harpocrates-evidence.mp4",
+            conditional=True,
+            etag=etag,
+        )
         if result.get("source_hash"):
             response.headers["X-Harpocrates-Source-Hash"] = result["source_hash"]
         if result.get("embedded_hash"):
