@@ -95,3 +95,19 @@ pre-registration review step (`openReview` / `EvidenceReviewSnapshot` in
 - Enforces fail-closed registration in `registerProof`: submission is blocked
   unless a valid review snapshot matching the current file and proof parameters
   is active.
+
+## Verification Timeline Observations
+
+The verification portal (`src/views/VerifyView.tsx`, `src/components/VerificationTimeline.tsx`,
+and `src/services/verificationFlow.ts`) extends the 5-stage verification timeline
+with observation provenance without replacing the stage model:
+
+- **Observation source & ledger bounds**: Each stage labels its source
+  (`Local browser`, `Backend (NeonDB)`, or `Soroban Registry`) and displays
+  observed Stellar ledger sequence bounds and on-chain expiry bounds when
+  available (`evaluateVerificationObservations`, `formatLedgerBounds`).
+- **Stale evidence vs. source disagreements**: The timeline distinguishes
+  **Stale evidence** (expired Soroban ledger bounds or backend observations
+  older than `DEFAULT_OBSERVATION_STALE_MS`) from **Source disagreement**
+  (contradictory identity tiers, mismatched video hashes, revoked on-chain
+  records vs. active backend events, or metadata envelope mismatches).
