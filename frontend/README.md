@@ -94,3 +94,20 @@ with observation provenance without replacing the stage model:
   older than `DEFAULT_OBSERVATION_STALE_MS`) from **Source disagreement**
   (contradictory identity tiers, mismatched video hashes, revoked on-chain
   records vs. active backend events, or metadata envelope mismatches).
+
+## Resumable Batch Verification Checkpoints
+
+Batch verification (`src/batchVerifier.ts`, `src/batchExport.ts`) supports
+fail-closed resumable checkpoints (`harpocrates-batch-checkpoint` v1):
+
+- **Privacy-safe persistence**: Checkpoints (`BatchVerificationCheckpoint`,
+  `exportBatchCheckpoint`, `parseBatchCheckpoint`) persist only nonsecret file
+  fingerprints (index, name, byte size, `lastModified`, MIME type, and bounded
+  head/tail SHA-256 `sampleHash`), policy limits, network context, and completed
+  sanitized results. Raw `File` handles, media bytes, and wallet addresses are
+  never persisted.
+- **Fail-closed resume validation**: `BatchVerifier.resumeBatch` (and
+  `runBatch(..., { checkpoint })`) validates input file identities, policy
+  limits (`maxFileSizeBytes`, `maxTotalSizeBytes`), and network context
+  (`apiBase`, `contractId`, `network`) via `validateBatchCheckpoint` and rejects
+  resumption with `BatchCheckpointError` on any mismatch or malformed payload.
