@@ -1,5 +1,4 @@
-import pytest
-from config import load_config
+from backend.config import load_config, AppConfig
 
 # Define the set of fields that are considered secret and should be redacted to a boolean.
 SECRET_FIELDS = {
