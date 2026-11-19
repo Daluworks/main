@@ -1,4 +1,4 @@
-from backend.config import load_config, AppConfig
+from backend.config import load_config
 
 # Define the set of fields that are considered secret and should be redacted to a boolean.
 SECRET_FIELDS = {
