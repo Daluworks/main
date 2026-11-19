@@ -96,3 +96,12 @@ fail-closed resumable checkpoints (`harpocrates-batch-checkpoint` v1):
   limits (`maxFileSizeBytes`, `maxTotalSizeBytes`), and network context
   (`apiBase`, `contractId`, `network`) via `validateBatchCheckpoint` and rejects
   resumption with `BatchCheckpointError` on any mismatch or malformed payload.
+- **Per-item cancellation & result categories**: `BatchVerifier.cancelItem(itemId)`
+  cancels a single queued (`pending`) or active (`hashing` / `processing`) item
+  via a per-item `AbortController` without stopping unrelated items, returning
+  `false` for unknown or already-terminal items. `classifyBatchOutcome` maps
+  every `BatchOutcome` into a canonical `BatchResultCategory` (`verified`,
+  `skipped`, `cancelled`, `failed`, or `in-progress`), surfaced in
+  `BatchSummary` (`verified`, `skipped`, `cancelled`, `failed`),
+  `CleanBatchReportItem.resultCategory`, `exportBatchJSON` (`counts`), and
+  `exportBatchCSV` (`Result Category`).

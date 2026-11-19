@@ -165,4 +165,69 @@ describe('batchExport', () => {
       ),
     ).toThrow(BatchCheckpointError)
   })
+
+  it('distinguishes verified, skipped, cancelled, and failed results in JSON and CSV exports', () => {
+    const mixedItems: BatchItemResult[] = [
+      ...mockItems,
+      {
+        id: 'item-3',
+        file: new File(['cancelled bytes'], 'cancelled.mp4', { type: 'video/mp4' }),
+        fileName: 'cancelled.mp4',
+        fileSizeBytes: 512,
+        status: 'cancelled',
+        videoHash: null,
+        metadataHash: null,
+        sourceHash: null,
+        tier: null,
+        chainStatus: null,
+        message: 'Cancelled by user.',
+        events: [],
+        chainProof: null,
+        duplicateOf: null,
+        manifest: null,
+        durationMs: 12,
+        failureReason: 'Item verification was cancelled by user request.',
+      },
+      {
+        id: 'item-4',
+        file: new File(['bad bytes'], 'corrupt.mp4', { type: 'video/mp4' }),
+        fileName: 'corrupt.mp4',
+        fileSizeBytes: 256,
+        status: 'malformed',
+        videoHash: null,
+        metadataHash: null,
+        sourceHash: null,
+        tier: null,
+        chainStatus: null,
+        message: 'Malformed evidence',
+        events: [],
+        chainProof: null,
+        duplicateOf: null,
+        manifest: null,
+        durationMs: 9,
+        failureReason: 'Malformed evidence',
+      },
+    ]
+
+    const sanitized = sanitizeBatchResults(mixedItems)
+    expect(sanitized.map((i) => i.resultCategory)).toEqual(['verified', 'skipped', 'cancelled', 'failed'])
+
+    const jsonReport = JSON.parse(exportBatchJSON(mixedItems)) as {
+      counts: { verified: number; skipped: number; cancelled: number; failed: number }
+      results: Array<{ fileName: string; resultCategory: string }>
+    }
+    expect(jsonReport.counts).toEqual({ verified: 1, skipped: 1, cancelled: 1, failed: 1 })
+    expect(jsonReport.results.map((r) => r.resultCategory)).toEqual(['verified', 'skipped', 'cancelled', 'failed'])
+
+    const csv = exportBatchCSV(mixedItems)
+    expect(csv).toContain('Result Category')
+    expect(csv).toContain('evidence1.mp4,1024,confirmed')
+    expect(csv).toContain(',verified')
+    expect(csv).toContain(',skipped')
+    expect(csv).toContain(',cancelled')
+    expect(csv).toContain(',failed')
+
+    const receipts = JSON.parse(exportReceiptCollection(mixedItems)) as { totalItems: number }
+    expect(receipts.totalItems).toBe(1)
+  })
 })

@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   BatchCheckpointError,
   BatchVerifier,
+  classifyBatchOutcome,
   computeBatchFingerprints,
   computeChunkedSha256,
   computeFileFingerprint,
@@ -10,6 +11,7 @@ import {
   type BatchConfig,
   type BatchVerificationCheckpoint,
 } from './batchVerifier'
+import * as verificationFlow from './verificationFlow'
 
 describe('batchVerifier', () => {
   describe('computeChunkedSha256', () => {
@@ -362,6 +364,171 @@ describe('batchVerifier', () => {
       await expect(verifier.resumeBatch([f1, f2], invalidStatusCheckpoint)).rejects.toBeInstanceOf(
         BatchCheckpointError,
       )
+    })
+  })
+
+  describe('Per-item cancellation and result classification', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('classifies batch outcomes into verified, skipped, cancelled, failed, and in-progress', () => {
+      expect(classifyBatchOutcome('confirmed')).toBe('verified')
+      expect(classifyBatchOutcome('manifest-valid')).toBe('verified')
+      expect(classifyBatchOutcome('duplicate')).toBe('skipped')
+      expect(classifyBatchOutcome('oversized')).toBe('skipped')
+      expect(classifyBatchOutcome('cancelled')).toBe('cancelled')
+      expect(classifyBatchOutcome('error')).toBe('failed')
+      expect(classifyBatchOutcome('malformed')).toBe('failed')
+      expect(classifyBatchOutcome('unavailable')).toBe('failed')
+      expect(classifyBatchOutcome('revoked')).toBe('failed')
+      expect(classifyBatchOutcome('metadata-only')).toBe('failed')
+      expect(classifyBatchOutcome('database-only')).toBe('failed')
+      expect(classifyBatchOutcome('manifest-invalid')).toBe('failed')
+      expect(classifyBatchOutcome('pending')).toBe('in-progress')
+      expect(classifyBatchOutcome('hashing')).toBe('in-progress')
+      expect(classifyBatchOutcome('processing')).toBe('in-progress')
+    })
+
+    it('cancels a queued item without stopping unrelated items and distinguishes verified, skipped, cancelled, and failed', async () => {
+      const verifySpy = vi.spyOn(verificationFlow, 'verifyArtifact').mockImplementation(async ({ file }) => {
+        if (file.name === 'bad.mp4') {
+          return {
+            outcome: 'malformed',
+            message: 'Malformed synthetic evidence.',
+            events: [],
+            chainProof: null,
+          }
+        }
+        return {
+          outcome: 'confirmed',
+          message: 'Confirmed synthetic evidence.',
+          events: [],
+          chainProof: null,
+        }
+      })
+
+      const verifier = new BatchVerifier({
+        maxConcurrency: 1,
+        maxFileSizeBytes: 100,
+        maxTotalSizeBytes: 1000,
+        contractId: '',
+      })
+
+      const fVerified = new File(['verified-1'], 'verified.mp4', { type: 'video/mp4' })
+      const fQueuedToCancel = new File(['cancel-me'], 'cancel-queued.mp4', { type: 'video/mp4' })
+      const fFailed = new File(['failed-1'], 'bad.mp4', { type: 'video/mp4' })
+      const fSkipped = new File(['x'.repeat(200)], 'oversized.mp4', { type: 'video/mp4' })
+
+      let cancelledQueued = false
+      const { items, summary } = await verifier.runBatch(
+        [fVerified, fQueuedToCancel, fFailed, fSkipped],
+        (_progress, currentItems) => {
+          if (!cancelledQueued) {
+            const target = currentItems.find((i) => i.fileName === 'cancel-queued.mp4' && i.status === 'pending')
+            if (target) {
+              cancelledQueued = verifier.cancelItem(target.id)
+            }
+          }
+        },
+      )
+
+      expect(cancelledQueued).toBe(true)
+      expect(verifySpy).toHaveBeenCalledTimes(2) // verified.mp4 and bad.mp4 only
+      expect(items.find((i) => i.fileName === 'verified.mp4')?.status).toBe('confirmed')
+      expect(items.find((i) => i.fileName === 'cancel-queued.mp4')?.status).toBe('cancelled')
+      expect(items.find((i) => i.fileName === 'bad.mp4')?.status).toBe('malformed')
+      expect(items.find((i) => i.fileName === 'oversized.mp4')?.status).toBe('oversized')
+
+      expect(summary.verified).toBe(1)
+      expect(summary.skipped).toBe(1)
+      expect(summary.cancelled).toBe(1)
+      expect(summary.failed).toBe(1)
+    })
+
+    it('cancels an active item mid-flight without aborting unrelated items and releases its hash for later duplicates', async () => {
+      let resolveActive!: () => void
+      let activeStarted!: () => void
+      const activeStartedPromise = new Promise<void>((resolve) => {
+        activeStarted = resolve
+      })
+      let activeSignalAborted = false
+
+      vi.spyOn(verificationFlow, 'verifyArtifact').mockImplementation(async ({ file, signal }) => {
+        if (file.name === 'active.mp4') {
+          activeStarted()
+          await new Promise<void>((resolve) => {
+            resolveActive = resolve
+            signal?.addEventListener(
+              'abort',
+              () => {
+                activeSignalAborted = true
+                resolve()
+              },
+              { once: true },
+            )
+          })
+          return {
+            outcome: 'confirmed',
+            message: 'Should not overwrite cancelled state.',
+            events: [],
+            chainProof: null,
+          }
+        }
+        return {
+          outcome: 'confirmed',
+          message: 'Unrelated item confirmed.',
+          events: [],
+          chainProof: null,
+        }
+      })
+
+      const verifier = new BatchVerifier({
+        maxConcurrency: 2,
+        contractId: '',
+      })
+
+      // Third file has identical content to active.mp4; since active.mp4 is cancelled,
+      // later-copy.mp4 must still be verified rather than skipped as a duplicate.
+      const fActive = new File(['shared-payload'], 'active.mp4', { type: 'video/mp4' })
+      const fUnrelated = new File(['unrelated-payload'], 'unrelated.mp4', { type: 'video/mp4' })
+      const fLaterCopy = new File(['shared-payload'], 'later-copy.mp4', { type: 'video/mp4' })
+
+      const batchPromise = verifier.runBatch([fActive, fUnrelated, fLaterCopy])
+      await activeStartedPromise
+
+      const activeItem = verifier.getItems().find((i) => i.fileName === 'active.mp4')
+      expect(activeItem).toBeDefined()
+      expect(verifier.cancelItem(activeItem!.id)).toBe(true)
+      resolveActive()
+
+      const { items, summary } = await batchPromise
+
+      expect(activeSignalAborted).toBe(true)
+      expect(items.find((i) => i.fileName === 'active.mp4')?.status).toBe('cancelled')
+      expect(items.find((i) => i.fileName === 'unrelated.mp4')?.status).toBe('confirmed')
+      expect(items.find((i) => i.fileName === 'later-copy.mp4')?.status).toBe('confirmed')
+      expect(summary.cancelled).toBe(1)
+      expect(summary.verified).toBe(2)
+      expect(summary.skipped).toBe(0)
+      expect(summary.failed).toBe(0)
+    })
+
+    it('returns false when cancelling unknown, already-completed, or already-cancelled items', async () => {
+      vi.spyOn(verificationFlow, 'verifyArtifact').mockResolvedValue({
+        outcome: 'confirmed',
+        message: 'Confirmed.',
+        events: [],
+        chainProof: null,
+      })
+
+      const verifier = new BatchVerifier({ maxConcurrency: 1, contractId: '' })
+      const f1 = new File(['done-payload'], 'done.mp4', { type: 'video/mp4' })
+      const { items } = await verifier.runBatch([f1])
+
+      expect(verifier.cancelItem('non-existent-id')).toBe(false)
+      expect(verifier.cancelItem(items[0].id)).toBe(false)
+      expect(verifier.getItems()[0].status).toBe('confirmed')
     })
   })
 })

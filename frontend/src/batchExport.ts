@@ -2,9 +2,11 @@ import {
   BATCH_CHECKPOINT_PROTOCOL,
   BATCH_CHECKPOINT_VERSION,
   BatchCheckpointError,
+  classifyBatchOutcome,
   isCompletedBatchOutcome,
   type BatchItemResult,
   type BatchOutcome,
+  type BatchResultCategory,
   type BatchVerificationCheckpoint,
 } from './batchVerifier'
 import type { ProofManifest } from './proofManifest'
@@ -13,6 +15,7 @@ export type CleanBatchReportItem = {
   fileName: string
   fileSizeBytes: number
   status: string
+  resultCategory: BatchResultCategory
   videoHash: string | null
   metadataHash: string | null
   sourceHash: string | null
@@ -41,6 +44,7 @@ export function sanitizeBatchResults(results: BatchItemResult[]): CleanBatchRepo
     fileName: item.fileName,
     fileSizeBytes: item.fileSizeBytes,
     status: item.status,
+    resultCategory: classifyBatchOutcome(item.status),
     videoHash: item.videoHash,
     metadataHash: item.metadataHash,
     sourceHash: item.sourceHash,
@@ -58,11 +62,18 @@ export function sanitizeBatchResults(results: BatchItemResult[]): CleanBatchRepo
  */
 export function exportBatchJSON(results: BatchItemResult[]): string {
   const clean = sanitizeBatchResults(results)
+  const counts = {
+    verified: clean.filter((item) => item.resultCategory === 'verified').length,
+    skipped: clean.filter((item) => item.resultCategory === 'skipped').length,
+    cancelled: clean.filter((item) => item.resultCategory === 'cancelled').length,
+    failed: clean.filter((item) => item.resultCategory === 'failed').length,
+  }
   const report = {
     protocol: 'harpocrates-batch-report',
     version: 1,
     exportedAt: new Date().toISOString(),
     totalCount: clean.length,
+    counts,
     results: clean,
   }
   return JSON.stringify(report, null, 2)
@@ -86,6 +97,7 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     'Duplicate Of',
     'Failure Reason',
     'Duration (ms)',
+    'Result Category',
   ]
 
   const rows = clean.map((item) => [
@@ -101,6 +113,7 @@ export function exportBatchCSV(results: BatchItemResult[]): string {
     escapeCSV(item.duplicateOf ?? ''),
     escapeCSV(item.failureReason ?? ''),
     item.durationMs !== null ? String(item.durationMs) : '',
+    escapeCSV(item.resultCategory),
   ])
 
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
@@ -113,7 +126,7 @@ export function exportReceiptCollection(results: BatchItemResult[]): string {
   const manifests: ProofManifest[] = []
 
   for (const item of results) {
-    if (item.manifest) {
+    if (item.manifest && item.status === 'manifest-valid') {
       manifests.push(item.manifest)
     } else if (item.status === 'confirmed' && item.videoHash && item.metadataHash && item.tier) {
       manifests.push({

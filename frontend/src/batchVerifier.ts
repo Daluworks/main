@@ -20,6 +20,37 @@ export type BatchOutcome =
   | 'unavailable'
   | 'cancelled'
 
+export type BatchResultCategory = 'verified' | 'skipped' | 'cancelled' | 'failed' | 'in-progress'
+
+/**
+ * Classifies a granular BatchOutcome into a canonical result category,
+ * distinguishing verified, skipped, cancelled, failed, and in-progress items.
+ */
+export function classifyBatchOutcome(status: BatchOutcome): BatchResultCategory {
+  switch (status) {
+    case 'confirmed':
+    case 'manifest-valid':
+      return 'verified'
+    case 'duplicate':
+    case 'oversized':
+      return 'skipped'
+    case 'cancelled':
+      return 'cancelled'
+    case 'pending':
+    case 'hashing':
+    case 'processing':
+      return 'in-progress'
+    case 'revoked':
+    case 'metadata-only':
+    case 'database-only':
+    case 'manifest-invalid':
+    case 'malformed':
+    case 'error':
+    case 'unavailable':
+      return 'failed'
+  }
+}
+
 export type BatchConfig = {
   maxConcurrency: number
   maxFileSizeBytes: number
@@ -148,6 +179,9 @@ export type BatchSummary = {
   duplicates: number
   errors: number
   cancelled: number
+  verified: number
+  skipped: number
+  failed: number
   totalBytes: number
   durationMs: number
 }
@@ -522,6 +556,8 @@ export class BatchVerifier {
   private config: BatchConfig
   private items: BatchItemResult[] = []
   private abortController: AbortController | null = null
+  private itemAbortControllers = new Map<string, AbortController>()
+  private cancelledItemIds = new Set<string>()
   private onProgressCallback?: (progress: BatchProgress, items: BatchItemResult[]) => void
   private onCheckpointCallback?: (checkpoint: BatchVerificationCheckpoint) => void
   private processedHashes = new Map<string, string>() // videoHash -> itemId
@@ -572,6 +608,9 @@ export class BatchVerifier {
     if (this.abortController) {
       this.abortController.abort()
     }
+    for (const controller of this.itemAbortControllers.values()) {
+      controller.abort()
+    }
     for (const item of this.items) {
       if (item.status === 'pending' || item.status === 'hashing' || item.status === 'processing') {
         item.status = 'cancelled'
@@ -580,6 +619,38 @@ export class BatchVerifier {
       }
     }
     this.notifyProgress(true, true)
+  }
+
+  /**
+   * Cancels a single queued (`pending`) or active (`hashing` / `processing`) item
+   * without stopping unrelated items in the batch.
+   * Returns true if the item was cancelled, or false if not found or already terminal.
+   */
+  public cancelItem(itemId: string): boolean {
+    const item = this.items.find((entry) => entry.id === itemId)
+    if (!item) {
+      return false
+    }
+    if (item.status !== 'pending' && item.status !== 'hashing' && item.status !== 'processing') {
+      return false
+    }
+
+    this.cancelledItemIds.add(itemId)
+    const itemController = this.itemAbortControllers.get(itemId)
+    if (itemController && !itemController.signal.aborted) {
+      itemController.abort()
+    }
+
+    if (item.videoHash && this.processedHashes.get(item.videoHash) === item.id) {
+      this.processedHashes.delete(item.videoHash)
+    }
+
+    item.status = 'cancelled'
+    item.message = 'Cancelled by user.'
+    item.failureReason = 'Item verification was cancelled by user request.'
+
+    this.notifyProgress(this.abortController?.signal.aborted ?? false, false)
+    return true
   }
 
   public async resumeBatch(
@@ -624,6 +695,8 @@ export class BatchVerifier {
     // Initialize item results
     const startTime = performance.now()
     this.processedHashes.clear()
+    this.itemAbortControllers.clear()
+    this.cancelledItemIds.clear()
     this.accumulatedTotalBytes = 0
     this.currentFingerprints = fingerprints
     this.checkpointCreatedAt = options?.checkpoint?.createdAt ?? new Date().toISOString()
@@ -720,10 +793,28 @@ export class BatchVerifier {
         if (signal.aborted) break
         const item = queue.shift()
         if (!item) break
+        if (item.status === 'cancelled' || this.cancelledItemIds.has(item.id)) {
+          continue
+        }
 
-        await this.processItem(item, signal)
+        const itemController = new AbortController()
+        this.itemAbortControllers.set(item.id, itemController)
+        const onBatchAbort = () => itemController.abort()
+        if (signal.aborted) {
+          itemController.abort()
+        } else {
+          signal.addEventListener('abort', onBatchAbort, { once: true })
+        }
+
+        try {
+          await this.processItem(item, itemController.signal)
+        } finally {
+          signal.removeEventListener('abort', onBatchAbort)
+          this.itemAbortControllers.delete(item.id)
+        }
+
         this.emitCheckpoint()
-        this.notifyProgress(false, queue.length === 0)
+        this.notifyProgress(signal.aborted, false)
       }
     }
 
@@ -757,15 +848,31 @@ export class BatchVerifier {
 
   private async processItem(item: BatchItemResult, signal: AbortSignal): Promise<void> {
     const itemStart = performance.now()
+    const isItemCancelled = () => signal.aborted || this.cancelledItemIds.has(item.id)
+    const markCancelled = (stageMessage: string) => {
+      if (item.videoHash && this.processedHashes.get(item.videoHash) === item.id) {
+        this.processedHashes.delete(item.videoHash)
+      }
+      item.status = 'cancelled'
+      item.message = this.cancelledItemIds.has(item.id) ? 'Cancelled by user.' : stageMessage
+      item.failureReason = this.cancelledItemIds.has(item.id)
+        ? 'Item verification was cancelled by user request.'
+        : 'Batch execution was aborted by user request.'
+      item.durationMs = performance.now() - itemStart
+    }
+
     try {
-      if (signal.aborted) {
-        item.status = 'cancelled'
-        item.message = 'Cancelled before starting.'
+      if (isItemCancelled()) {
+        markCancelled('Cancelled before starting.')
         return
       }
 
       // Check if item is a standalone JSON proof manifest receipt
       const manifest = await tryParseManifest(item.file)
+      if (isItemCancelled()) {
+        markCancelled('Cancelled during manifest parsing.')
+        return
+      }
       if (manifest) {
         item.manifest = manifest
         item.videoHash = manifest.videoHash
@@ -786,6 +893,10 @@ export class BatchVerifier {
               manifest.videoHash,
               this.config.wallet,
             )
+            if (isItemCancelled()) {
+              markCancelled('Cancelled during manifest chain check.')
+              return
+            }
             item.chainProof = chainProof
             if (chainProof) {
               item.chainStatus = chainProof.status === 2 ? 'Revoked' : 'Active'
@@ -795,6 +906,10 @@ export class BatchVerifier {
               }
             }
           } catch {
+            if (isItemCancelled()) {
+              markCancelled('Cancelled during manifest chain check.')
+              return
+            }
             // Non-fatal for manifest check
           }
         }
@@ -806,14 +921,13 @@ export class BatchVerifier {
       // Standard Evidence Video Processing
       item.status = 'hashing'
       item.message = 'Computing local SHA-256 commitment...'
-      this.notifyProgress(false, false)
+      this.notifyProgress(this.abortController?.signal.aborted ?? false, false)
 
       const videoHash = await computeChunkedSha256(item.file, signal)
       item.videoHash = videoHash
 
-      if (signal.aborted) {
-        item.status = 'cancelled'
-        item.message = 'Cancelled during hashing.'
+      if (isItemCancelled()) {
+        markCancelled('Cancelled during hashing.')
         return
       }
 
@@ -833,72 +947,46 @@ export class BatchVerifier {
       // Verification Flow
       item.status = 'processing'
       item.message = 'Extracting stego metadata and checking Stellar registry...'
-      this.notifyProgress(false, false)
+      this.notifyProgress(this.abortController?.signal.aborted ?? false, false)
 
       const result = await verifyArtifact({
         apiBase: this.config.apiBase,
         contractId: this.config.contractId,
         wallet: this.config.wallet,
         file: item.file,
+        videoHash,
         signal,
-        onEvent: (event) => {
-          item.events.push(event)
-          if (event.message) {
-            item.message = event.message
-          }
-          this.notifyProgress(false, false)
-        },
       })
 
-      item.videoHash = result.videoHash ?? item.videoHash
-      item.metadataHash = result.metadataHash ?? null
-      item.sourceHash = result.sourceHash ?? null
-      item.tier = result.tier ?? null
-      item.chainProof = result.chainProof ?? null
-      item.chainStatus = result.chainStatus ?? null
-      item.status = result.status
+      if (isItemCancelled()) {
+        markCancelled('Cancelled during verification.')
+        return
+      }
+
+      item.events = result.events
+      item.chainProof = result.chainProof
+      item.metadataHash = result.chainProof?.metadataHash ?? null
+      item.sourceHash = result.chainProof?.sourceHash ?? null
+      item.tier = result.events[0]?.tier ?? null
+      item.chainStatus = result.chainProof
+        ? result.chainProof.status === 2
+          ? 'Revoked'
+          : 'Active'
+        : null
+      item.status = result.outcome
       item.message = result.message
-      item.failureReason = result.failureReason ?? null
+      item.failureReason = classifyBatchOutcome(result.outcome) === 'failed' ? result.message : null
       item.durationMs = performance.now() - itemStart
     } catch (err) {
-      if (signal.aborted) {
-        item.status = 'cancelled'
-        item.message = 'Cancelled.'
-        item.failureReason = 'Batch execution was aborted by user request.'
+      if (isItemCancelled()) {
+        markCancelled('Cancelled.')
       } else {
         item.status = 'error'
         item.message = err instanceof Error ? err.message : 'Unknown error.'
         item.failureReason = item.message
+        item.durationMs = performance.now() - itemStart
       }
-      item.durationMs = performance.now() - itemStart
     }
-  }
-
-  private notifyProgress(isCancelled: boolean, isDone: boolean): void {
-    if (!this.onProgressCallback) return
-    const totalFiles = this.items.length
-    const completedFiles = this.items.filter(
-      (i) => i.status !== 'pending' && i.status !== 'hashing' && i.status !== 'processing',
-    ).length
-    const activeCount = this.items.filter(
-      (i) => i.status === 'hashing' || i.status === 'processing',
-    ).length
-    const processedBytes = this.items.reduce((acc, i) => {
-      if (i.status === 'pending' || i.status === 'hashing') return acc
-      return acc + i.fileSizeBytes
-    }, 0)
-    this.onProgressCallback(
-      {
-        totalFiles,
-        completedFiles,
-        processedBytes,
-        totalBytes: this.accumulatedTotalBytes,
-        activeCount,
-        isCancelled,
-        isDone,
-      },
-      [...this.items],
-    )
   }
 
   private computeSummary(durationMs: number): BatchSummary {
@@ -911,12 +999,24 @@ export class BatchVerifier {
       duplicates: 0,
       errors: 0,
       cancelled: 0,
+      verified: 0,
+      skipped: 0,
+      failed: 0,
       totalBytes: 0,
       durationMs,
     }
 
     for (const item of this.items) {
       summary.totalBytes += item.fileSizeBytes
+      const category = classifyBatchOutcome(item.status)
+      if (category === 'verified') {
+        summary.verified++
+      } else if (category === 'skipped') {
+        summary.skipped++
+      } else if (category === 'failed') {
+        summary.failed++
+      }
+
       switch (item.status) {
         case 'confirmed':
           summary.confirmed++
