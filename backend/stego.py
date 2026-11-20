@@ -30,6 +30,10 @@ BORDER_BLOCK = 6
 BORDER_STRIDE = 2
 
 
+class StegoLimitExceededError(RuntimeError):
+    """Raised when steganography processing exceeds configured resource limits."""
+
+
 @dataclass(frozen=True)
 class VideoInfo:
     width: int
