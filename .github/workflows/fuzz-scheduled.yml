@@ -76,7 +76,7 @@ jobs:
           echo "fuzz seed: $FUZZ_SEED"
 
       - name: Fuzz parsers and verifier-input codec
-        run: cargo +nightly fuzz run classify_public_inputs -- -max_total_time=30
+        run: SET THIS   # command from docs/zk-fuzzing.md / docs/zk-conformance-vectors.md
 
       - name: Upload synthetic failing inputs
         if: failure()

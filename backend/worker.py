@@ -1,11 +1,10 @@
 import logging
 import time
 import os
+from logging_utils import log_structured
 import threading
 import traceback
 from pathlib import Path
-from config import load_config
-from logging_utils import log_structured
 
 from db import (
     lease_job,
