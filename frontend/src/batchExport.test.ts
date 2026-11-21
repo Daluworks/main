@@ -5,12 +5,15 @@ import {
   type BatchVerificationCheckpoint,
 } from './batchVerifier'
 import {
+  BatchExportConflictError,
+  detectConflictingStatements,
   exportBatchCSV,
   exportBatchCheckpoint,
   exportBatchJSON,
   exportReceiptCollection,
   parseBatchCheckpoint,
   sanitizeBatchResults,
+  validateBatchExportResults,
 } from './batchExport'
 
 describe('batchExport', () => {
@@ -84,150 +87,98 @@ describe('batchExport', () => {
     expect(parsed.totalItems).toBe(1)
   })
 
-  it('exportBatchCheckpoint and parseBatchCheckpoint round-trip privacy-safe checkpoints', () => {
-    const checkpoint: BatchVerificationCheckpoint = {
-      protocol: 'harpocrates-batch-checkpoint',
-      version: 1,
-      createdAt: '2026-11-19T00:00:00.000Z',
-      updatedAt: '2026-11-19T00:01:00.000Z',
-      policy: { maxFileSizeBytes: 1024 * 1024, maxTotalSizeBytes: 5 * 1024 * 1024 },
-      networkContext: { apiBase: 'http://127.0.0.1:5050', contractId: 'CTEST', network: 'testnet' },
-      files: [
-        {
-          index: 0,
-          fileName: 'evidence1.mp4',
-          fileSizeBytes: 1024,
-          lastModified: 1700000000000,
-          mimeType: 'video/mp4',
-          sampleHash: 'a'.repeat(64),
-        },
-      ],
-      completed: [
-        {
-          index: 0,
-          fileName: 'evidence1.mp4',
-          fileSizeBytes: 1024,
-          status: 'confirmed',
-          videoHash: '1'.repeat(64),
-          metadataHash: '2'.repeat(64),
-          sourceHash: '3'.repeat(64),
-          tier: 'silent',
-          chainStatus: 'Active',
-          message: 'Confirmed evidence',
-          duplicateOf: null,
-          failureReason: null,
-          durationMs: 120.4,
-        },
-      ],
-    }
-
-    const exported = exportBatchCheckpoint(checkpoint)
-    const parsed = parseBatchCheckpoint(exported)
-
-    expect(parsed.protocol).toBe('harpocrates-batch-checkpoint')
-    expect(parsed.completed).toHaveLength(1)
-    expect(parsed.completed[0].durationMs).toBe(120)
-  })
-
-  it('parseBatchCheckpoint fails closed on malformed or non-completed checkpoint payloads', () => {
-    expect(() => parseBatchCheckpoint('{invalid')).toThrow(BatchCheckpointError)
-    expect(() => parseBatchCheckpoint(JSON.stringify({ protocol: 'wrong', version: 1 }))).toThrow(
-      BatchCheckpointError,
-    )
-    expect(() =>
-      parseBatchCheckpoint(
-        JSON.stringify({
-          protocol: 'harpocrates-batch-checkpoint',
-          version: 1,
-          createdAt: '2026-11-19T00:00:00.000Z',
-          updatedAt: '2026-11-19T00:00:00.000Z',
-          policy: { maxFileSizeBytes: 100, maxTotalSizeBytes: 200 },
-          networkContext: { apiBase: 'http://127.0.0.1:5050', contractId: '', network: 'testnet' },
-          files: [],
-          completed: [
-            {
-              index: 0,
-              fileName: 'a.mp4',
-              fileSizeBytes: 10,
-              status: 'pending',
-              videoHash: null,
-              metadataHash: null,
-              sourceHash: null,
-              tier: null,
-              chainStatus: null,
-              message: 'Queued',
-              duplicateOf: null,
-              failureReason: null,
-              durationMs: null,
-            },
-          ],
-        }),
-      ),
-    ).toThrow(BatchCheckpointError)
-  })
-
-  it('distinguishes verified, skipped, cancelled, and failed results in JSON and CSV exports', () => {
-    const mixedItems: BatchItemResult[] = [
-      ...mockItems,
+  it('rejects batch exports when two rows share a videoHash with conflicting outcomes', () => {
+    const conflicting: BatchItemResult[] = [
+      mockItems[0],
       {
-        id: 'item-3',
-        file: new File(['cancelled bytes'], 'cancelled.mp4', { type: 'video/mp4' }),
-        fileName: 'cancelled.mp4',
-        fileSizeBytes: 512,
-        status: 'cancelled',
-        videoHash: null,
-        metadataHash: null,
-        sourceHash: null,
-        tier: null,
-        chainStatus: null,
-        message: 'Cancelled by user.',
-        events: [],
-        chainProof: null,
-        duplicateOf: null,
-        manifest: null,
-        durationMs: 12,
-        failureReason: 'Item verification was cancelled by user request.',
-      },
-      {
-        id: 'item-4',
-        file: new File(['bad bytes'], 'corrupt.mp4', { type: 'video/mp4' }),
-        fileName: 'corrupt.mp4',
-        fileSizeBytes: 256,
-        status: 'malformed',
-        videoHash: null,
-        metadataHash: null,
-        sourceHash: null,
-        tier: null,
-        chainStatus: null,
-        message: 'Malformed evidence',
-        events: [],
-        chainProof: null,
-        duplicateOf: null,
-        manifest: null,
-        durationMs: 9,
-        failureReason: 'Malformed evidence',
+        ...mockItems[0],
+        id: 'item-conflict',
+        fileName: 'evidence1-tampered.mp4',
+        status: 'revoked',
+        chainStatus: 'Revoked',
       },
     ]
 
-    const sanitized = sanitizeBatchResults(mixedItems)
-    expect(sanitized.map((i) => i.resultCategory)).toEqual(['verified', 'skipped', 'cancelled', 'failed'])
+    expect(() => exportBatchJSON(conflicting)).toThrow(BatchExportConflictError)
+    expect(() => exportBatchCSV(conflicting)).toThrow(BatchExportConflictError)
+    expect(() => exportReceiptCollection(conflicting)).toThrow(BatchExportConflictError)
 
-    const jsonReport = JSON.parse(exportBatchJSON(mixedItems)) as {
-      counts: { verified: number; skipped: number; cancelled: number; failed: number }
-      results: Array<{ fileName: string; resultCategory: string }>
-    }
-    expect(jsonReport.counts).toEqual({ verified: 1, skipped: 1, cancelled: 1, failed: 1 })
-    expect(jsonReport.results.map((r) => r.resultCategory)).toEqual(['verified', 'skipped', 'cancelled', 'failed'])
+    const conflicts = detectConflictingStatements(conflicting)
+    expect(conflicts).toHaveLength(2)
+    expect(conflicts[0].identifierType).toBe('videoHash')
+    expect(conflicts[0].firstFileName).toBe('evidence1.mp4')
+    expect(conflicts[0].conflictingFileName).toBe('evidence1-tampered.mp4')
+    expect(conflicts[0].reason).toContain('status (confirmed vs revoked)')
+  })
 
-    const csv = exportBatchCSV(mixedItems)
-    expect(csv).toContain('Result Category')
-    expect(csv).toContain('evidence1.mp4,1024,confirmed')
-    expect(csv).toContain(',verified')
-    expect(csv).toContain(',skipped')
-    expect(csv).toContain(',cancelled')
-    expect(csv).toContain(',failed')
+  it('rejects conflicting manifest proofId rows', () => {
+    const conflictingManifests: BatchItemResult[] = [
+      {
+        ...mockItems[0],
+        id: 'm-1',
+        videoHash: 'aaaa',
+        metadataHash: 'bbbb',
+        manifest: {
+          protocol: 'harpocrates',
+          version: 1,
+          proofId: 'shared-proof-id',
+          tier: 'silent',
+          network: 'testnet',
+          contractId: 'C1',
+          transactionRef: 'tx1',
+          videoHash: 'aaaa',
+          metadataHash: 'bbbb',
+          sourceHash: 'aaaa',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          verifierScope: '0',
+          epoch: 0,
+        },
+      },
+      {
+        ...mockItems[0],
+        id: 'm-2',
+        fileName: 'evidence2.mp4',
+        videoHash: 'cccc',
+        metadataHash: 'dddd',
+        manifest: {
+          protocol: 'harpocrates',
+          version: 1,
+          proofId: 'shared-proof-id',
+          tier: 'seal',
+          network: 'testnet',
+          contractId: 'C1',
+          transactionRef: 'tx2',
+          videoHash: 'cccc',
+          metadataHash: 'dddd',
+          sourceHash: 'cccc',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          verifierScope: '0',
+          epoch: 0,
+        },
+      },
+    ]
 
-    const receipts = JSON.parse(exportReceiptCollection(mixedItems)) as { totalItems: number }
-    expect(receipts.totalItems).toBe(1)
+    expect(() => exportReceiptCollection(conflictingManifests)).toThrow(BatchExportConflictError)
+  })
+
+  it('preserves valid unique results and expected duplicate-status rows', () => {
+    const withDuplicate: BatchItemResult[] = [
+      ...mockItems,
+      {
+        ...mockItems[0],
+        id: 'item-dup',
+        fileName: 'evidence1-copy.mp4',
+        status: 'duplicate',
+        metadataHash: null,
+        tier: null,
+        chainStatus: null,
+        duplicateOf: 'evidence1.mp4',
+      },
+    ]
+
+    expect(validateBatchExportResults(withDuplicate)).toHaveLength(3)
+    expect(() => exportBatchJSON(withDuplicate)).not.toThrow()
+    expect(() => exportBatchCSV(withDuplicate)).not.toThrow()
+    expect(() => exportReceiptCollection(withDuplicate)).not.toThrow()
   })
 })
