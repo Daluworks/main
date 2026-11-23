@@ -140,8 +140,110 @@ export type BatchRunOptions = {
   onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
 }
 
+export const BATCH_CHECKPOINT_PROTOCOL = 'harpocrates-batch-checkpoint' as const
+export const BATCH_CHECKPOINT_VERSION = 1 as const
+
+export type BatchFileFingerprint = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  lastModified: number
+  mimeType: string
+  sampleHash: string
+}
+
+export type BatchCheckpointPolicy = {
+  maxFileSizeBytes: number
+  maxTotalSizeBytes: number
+}
+
+export type BatchCheckpointNetworkContext = {
+  apiBase: string
+  contractId: string
+  network: string
+}
+
+export type BatchCheckpointCompletedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  status: BatchOutcome
+  videoHash: string | null
+  metadataHash: string | null
+  sourceHash: string | null
+  tier: string | null
+  chainStatus: string | null
+  message: string
+  duplicateOf: string | null
+  failureReason: string | null
+  durationMs: number | null
+}
+
+export type BatchVerificationCheckpoint = {
+  protocol: typeof BATCH_CHECKPOINT_PROTOCOL
+  version: typeof BATCH_CHECKPOINT_VERSION
+  createdAt: string
+  updatedAt: string
+  policy: BatchCheckpointPolicy
+  networkContext: BatchCheckpointNetworkContext
+  files: BatchFileFingerprint[]
+  completed: BatchCheckpointCompletedItem[]
+}
+
+export type CheckpointMismatchReason =
+  | 'invalid-format'
+  | 'policy-mismatch'
+  | 'network-mismatch'
+  | 'files-mismatch'
+
+export type CheckpointValidationResult =
+  | { ok: true }
+  | {
+      ok: false
+      reason: CheckpointMismatchReason
+      message: string
+    }
+
+export class BatchCheckpointError extends Error {
+  public readonly reason: CheckpointMismatchReason
+
+  constructor(reason: CheckpointMismatchReason, message: string) {
+    super(message)
+    this.name = 'BatchCheckpointError'
+    this.reason = reason
+  }
+}
+
+export type BatchRunOptions = {
+  checkpoint?: BatchVerificationCheckpoint
+  onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
+}
+
+/**
+ * Explicit input descriptor binding a selected File to a caller-supplied
+ * identity and zero-based selection index so batch results remain stably
+ * ordered across concurrent completions and subset retries.
+ */
+export type BatchInputItem = {
+  /** Stable identifier for the selected input (auto-generated when omitted). */
+  id?: string
+  /** Zero-based position in the original selected input list (defaults to array index). */
+  inputIndex?: number
+  /** Selected evidence File or standalone JSON proof manifest. */
+  file: File
+}
+
+/**
+ * Accepted input entry for {@link BatchVerifier.runBatch}: either a raw `File`
+ * (indexed by its array position) or a {@link BatchInputItem} with an explicit
+ * original input identity.
+ */
+export type BatchInput = File | BatchInputItem
+
 export type BatchItemResult = {
   id: string
+  /** Zero-based position of this item in the original selected input list. */
+  inputIndex?: number
   file: File
   fileName: string
   fileSizeBytes: number
@@ -549,8 +651,44 @@ export async function tryParseManifest(file: File): Promise<ProofManifest | null
 }
 
 /**
- * Worker pool class for managing batch verification with bounded concurrency
- * and resource safety.
+ * Returns a new array of batch results ordered by their original selected
+ * `inputIndex`, never by asynchronous completion order or duration.
+ *
+ * Items carrying a finite `inputIndex` are placed first in ascending order
+ * (with ties broken by relative array position); legacy items without a finite
+ * `inputIndex` preserve their relative array position afterwards.
+ */
+export function orderBatchResults(results: readonly BatchItemResult[]): BatchItemResult[] {
+  return results
+    .map((item, position) => ({ item, position }))
+    .sort((a, b) => {
+      const aHasIndex =
+        typeof a.item.inputIndex === 'number' && Number.isFinite(a.item.inputIndex)
+      const bHasIndex =
+        typeof b.item.inputIndex === 'number' && Number.isFinite(b.item.inputIndex)
+
+      if (aHasIndex && bHasIndex) {
+        const diff = (a.item.inputIndex as number) - (b.item.inputIndex as number)
+        if (diff !== 0) return diff
+        return a.position - b.position
+      }
+      if (aHasIndex) return -1
+      if (bHasIndex) return 1
+      return a.position - b.position
+    })
+    .map(({ item }) => item)
+}
+
+type HashClaim = {
+  owner: BatchItemResult
+  duplicates: BatchItemResult[]
+  verificationPromise: Promise<void>
+}
+
+/**
+ * Worker pool class for managing batch verification with bounded concurrency,
+ * resource safety, and stable input-order result association regardless of
+ * asynchronous completion order.
  */
 export class BatchVerifier {
   private config: BatchConfig
@@ -578,7 +716,7 @@ export class BatchVerifier {
   }
 
   public getItems(): BatchItemResult[] {
-    return [...this.items]
+    return this.snapshotItems()
   }
 
   public setOnProgress(cb: (progress: BatchProgress, items: BatchItemResult[]) => void): void {
@@ -664,6 +802,7 @@ export class BatchVerifier {
 
   public async runBatch(
     files: File[],
+    checkpoint: BatchVerificationCheckpoint,
     onProgress?: (progress: BatchProgress, items: BatchItemResult[]) => void,
     options?: BatchRunOptions,
   ): Promise<{ items: BatchItemResult[]; summary: BatchSummary; checkpoint: BatchVerificationCheckpoint }> {
@@ -730,6 +869,7 @@ export class BatchVerifier {
       }
       return {
         id,
+        inputIndex,
         file,
         fileName: file.name,
         fileSizeBytes: file.size,
@@ -748,6 +888,8 @@ export class BatchVerifier {
         failureReason: null,
       }
     })
+
+    this.items = orderBatchResults(initialItems)
 
     this.notifyProgress(false, false)
 
@@ -784,7 +926,7 @@ export class BatchVerifier {
     this.accumulatedTotalBytes = currentBatchBytes
     this.notifyProgress(false, false)
 
-    // Execute with bounded concurrency
+    // Execute with bounded concurrency while writing back to fixed input slots
     const queue = this.items.filter((item) => item.status === 'pending')
     const concurrency = Math.max(1, Math.min(8, this.config.maxConcurrency))
 
