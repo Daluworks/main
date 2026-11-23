@@ -1,12 +1,21 @@
 /**
- * verificationFlow — orchestrates the verification portal flow.
+ * verificationFlow — orchestrates the verification portal flow and maps
+ * stable trust reason codes to accessible, privacy-safe copy.
  *
  * Responsibility: combine the Flask extraction, NeonDB lookup, and the
- * Soroban on-chain registry into a single result. No React state.
+ * Soroban on-chain registry into a single structured result with independent
+ * trust dimensions, and bind cached verification results to their statement
+ * and trust snapshot identity so incompatible context changes require a fresh
+ * explicit verification result. No React state.
  */
 
-import type { ChainProofRecord } from '../stellarTypes'
+import type { ChainProofRecord, IssuerRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
+import type { VerificationErrorCode, VerificationStatus } from '../hooks/useVerification'
+import {
+  isLookupEligibleIssuer,
+  type IssuerTrustState,
+} from '../provenance/issuerTrust'
 import { assertValidVideoHash } from './videoHash'
 import {
   extractMetadata,
@@ -287,20 +296,28 @@ export function evaluateVerificationObservations(input: {
  */
 export async function runVerificationFlow(
   videoHash: string,
-  options: { signal?: AbortSignal; sourceAddress?: string } = {},
+  options: VerificationFlowOptions = {},
 ): Promise<VerificationResult> {
+  throwIfAborted(options.signal)
   const safeHash = assertValidVideoHash(videoHash)
 
   const events = await fetchProofEventsByVideo(safeHash, options.signal)
-  const onChain = await getOnChainProof(safeHash, options.sourceAddress)
+  throwIfAborted(options.signal)
 
-  return {
+  const onChain = await getOnChainProof(safeHash, options.sourceAddress)
+  throwIfAborted(options.signal)
+
+  const result: VerificationResult = {
     videoHash: safeHash,
-    hasHarpocratesMetadata: events.length > 0,
+    hasHarpocratesMetadata,
     events,
     onChain: onChain,
     observations: evaluateVerificationObservations({ events, chainProof: onChain }),
   }
+  if (options.revision !== undefined) {
+    result.revision = options.revision
+  }
+  return result
 }
 
 /**
@@ -310,11 +327,24 @@ export async function runVerificationFlow(
 export async function verifyUploadedVideo(
   file: File,
   videoHash: string,
-  options: { signal?: AbortSignal; sourceAddress?: string } = {},
+  options: VerificationFlowOptions = {},
 ): Promise<VerificationResult> {
+  throwIfAborted(options.signal)
   // Validate before hitting the network at all.
   const safeHash = assertValidVideoHash(videoHash)
   const extract = await extractMetadata(file, options.signal)
+  throwIfAborted(options.signal)
   const result = await runVerificationFlow(safeHash, options)
-  return { ...result, hasHarpocratesMetadata: extract.hasHarpocratesMetadata }
+  const hasHarpocratesMetadata = extract.hasHarpocratesMetadata
+  return {
+    ...result,
+    hasHarpocratesMetadata,
+    trust: buildVerificationDimensions({
+      hasHarpocratesMetadata,
+      events: result.events,
+      onChain: result.onChain,
+      issuerRecord: options.issuerRecord,
+      nowUnixSeconds: options.nowUnixSeconds,
+    }),
+  }
 }
